@@ -1,0 +1,39 @@
+# 个人配置 —— 不提交
+config.json
+settings.json
+
+# 业务运行记录 —— 不提交
+Records/
+*.xlsx
+
+# 运行产物
+index_cache*.json
+debug.log
+Temp/
+__pycache__/
+*.pyc
+*.tmp
+
+# 本地备份
+旧版/
+
+# 本地工具 / 环境（非项目文件）
+.workbuddy/
+site-packages/
+
+# 运行时二进制 —— 不提交（通过 install_deps.bat 获取）
+python/
+Tesseract-OCR/
+poppler*/
+deps/
+
+# 打包产物
+build/
+dist/
+*.exe
+
+# 操作系统 / 编辑器元文件
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

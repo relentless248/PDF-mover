@@ -1,0 +1,50 @@
+{
+    "project_pattern": "[A-Z]{2,5}\\d{6,10}",
+    "project_pattern_segments": [
+        {"type": "letters", "case": "upper", "min_len": 2, "max_len": 5},
+        {"type": "digits", "min_len": 6, "max_len": 10}
+    ],
+    "see_keywords": ["see"],
+    "relation_keyword": "关联",
+    "not_found_keyword": "未找到项目",
+    "filename_rules": {
+        "unidentified": "未识别_{original}",
+        "not_found": "未找到项目_{project_id}.pdf",
+        "see_relation": "关联{see_id}_未找到项目_{project_id}.pdf",
+        "multi_project": "多项目_{original}",
+        "skip_identified": "{project_id}.pdf"
+    },
+    "target_filename": "TDS",
+    "target_subfolder": {"name": "Data"},
+    "folder_match": {"prefix_match": true, "word_boundary_match": true},
+    "year_rules": {"prefix_length": 4, "century_prefix": "20", "unknown_folder": "未分类"},
+    "years": {"available": []},
+    "ocr": {
+        "languages": ["eng", "chi_sim"],
+        "dpi": 400,
+        "max_pages": 5,
+        "config": "--psm 3 --oem 3 -c preserve_interword_spaces=1",
+        "page_timeout_sec": 20,
+        "convert_timeout_sec": 30,
+        "preview_timeout_sec": 15,
+        "auto_rotate": true,
+        "rotate_step": 90
+    },
+    "cache": {
+        "ocr_max": 50,
+        "search_max": 100,
+        "search_depth": 1,
+        "chunk_size": 10000,
+        "cache_ttl_days": 7
+    },
+    "file_ops": {
+        "retries": 5,
+        "retry_interval_sec": 2,
+        "skip_dirs": ["$RECYCLE.BIN", "$WINDOWS.~BT", "System Volume Information", "Temp", "tmp"]
+    },
+    "records": {"auto_save_count": 10},
+    "deps": {
+        "tesseract_dir": "Tesseract-OCR",
+        "poppler_dir": "poppler-25.12.0"
+    }
+}
