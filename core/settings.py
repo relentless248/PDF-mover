@@ -73,8 +73,8 @@ DEFAULT_SETTINGS = {
     # 年份提取规则（仅从编号内嵌数字段提取；unknown_folder 为未识别年份的归档目录名）
     "year_rules": {"prefix_length": 4, "century_prefix": "20", "unknown_folder": "未分类"},
 
-    # 可用年份分类管理（用于预置主程序年份下拉；为空则只显示扫描发现的年份）
-    "years": {"available": []},
+    # 年份分类管理（enabled 控制是否启用年份筛选功能；available 用于预置主程序年份下拉）
+    "years": {"enabled": True, "available": []},
 
     # OCR 识别参数（languages 为语言代码列表，如 ["eng"], ["chi_sim"], ["eng","chi_sim"]）
     "ocr": {
@@ -375,7 +375,12 @@ class Settings:
 
     @property
     def years_config(self):
-        return self.data.get("years", {"available": []})
+        return self.data.get("years", {"enabled": True, "available": []})
+
+    @property
+    def year_enabled(self):
+        """是否启用年份筛选功能（主界面勾选开关，关闭时跳过一切年份过滤）。"""
+        return bool(self.data.get("years", {}).get("enabled", True))
 
     @property
     def file_ops(self):

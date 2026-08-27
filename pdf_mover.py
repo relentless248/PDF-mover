@@ -637,6 +637,22 @@ class PDFMoverApp:
     def on_year_changed(self, event):
         self.status_var.set(f"已切换年份为：{self.selected_year_var.get()}，请点击「重建索引」以更新文件夹列表")
 
+    def _on_year_toggle(self):
+        """主界面「启用年份筛选」勾选开关：即时生效并持久化到 settings.json。"""
+        enabled = self.year_enabled_var.get()
+        try:
+            settings.data.setdefault("years", {})["enabled"] = bool(enabled)
+            settings.save()
+        except OSError:
+            pass
+        if enabled:
+            self.year_combo.config(state="normal")
+            self.status_var.set("年份筛选已启用：输入或选择年份后点击「重建索引」生效")
+        else:
+            self.selected_year_var.set("全部")
+            self.year_combo.config(state="disabled")
+            self.status_var.set("年份筛选已关闭：扫描与统计将包含全部年份")
+
     def extract_see_from_filename(self, filename):
         match = settings.see_from_filename_regex.search(filename)
         return match.group(1).strip() if match else None
@@ -770,7 +786,7 @@ class PDFMoverApp:
         UPDATE_INTERVAL = 100
         skip_dirs = set(settings.file_ops['skip_dirs'])
 
-        target_year = self.selected_year_var.get()
+        target_year = self.selected_year_var.get() if settings.year_enabled else "全部"
         self.encountered_years = set()
 
         # 第一步：统计总数（使用递归扫描，每个根目录独立深度）
@@ -804,8 +820,8 @@ class PDFMoverApp:
         # 更新共享变量（加锁）
         with self.thread_lock:
             self.all_project_folders = local_folders
-            # 更新年份选项
-            if self.encountered_years:
+            # 更新年份选项（年份筛选关闭时不更新）
+            if settings.year_enabled and self.encountered_years:
                 years_list = sorted(list(self.encountered_years))
                 self.root.after(0, lambda: self._update_year_combo(years_list))
 
@@ -821,7 +837,7 @@ class PDFMoverApp:
         self.indexing = False
         self.save_index_cache()
 
-        target_year = self.selected_year_var.get()
+        target_year = self.selected_year_var.get() if settings.year_enabled else "全部"
 
         msg_lines = []
         msg_lines.append(f"索引构建完成！")
@@ -834,7 +850,7 @@ class PDFMoverApp:
         if error_count > 0:
             msg_lines.append(f"忽略错误：{error_count} 个")
 
-        if encountered_years:
+        if settings.year_enabled and encountered_years:
             sorted_years = sorted(list(encountered_years))
             years_str = "、".join(sorted_years)
             msg_lines.append("")
@@ -1131,7 +1147,7 @@ class PDFMoverApp:
             msg += f"   - 有关联号文件：{see_related_count}\n"
             msg += f"   - 无关联号文件：{no_see_count}\n"
             msg += f"   - 未识别编号文件：{no_id_count}\n"
-            if year_stats:
+            if year_stats and settings.year_enabled:
                 msg += "\n📅 剩余文件按年份统计：\n"
                 for year in sorted(year_stats.keys()):
                     msg += f"   {year}年：{year_stats[year]} 个文件\n"
@@ -1967,14 +1983,21 @@ class PDFMoverApp:
         tk.Button(top_frame, text="⚙ 设置", command=self.open_settings, width=8).grid(row=0, column=4, padx=2)
         tk.Button(top_frame, text="❓ 帮助", command=self.show_help, width=8).grid(row=0, column=5, padx=2)
 
-        # 年份选择栏
+        # 年份选择栏（含「启用年份筛选」开关，勾选状态持久化到 settings.json）
         year_frame = tk.Frame(main_container)
         year_frame.grid(row=1, column=0, sticky="ew", pady=2)
         tk.Label(year_frame, text="分拣年份:").pack(side=tk.LEFT, padx=3)
         self.year_combo = ttk.Combobox(year_frame, textvariable=self.selected_year_var, values=self.year_options, state="normal", width=10)
         self.year_combo.pack(side=tk.LEFT, padx=5)
         self.year_combo.bind("<<ComboboxSelected>>", self.on_year_changed)
+        self.year_enabled_var = tk.BooleanVar(value=settings.year_enabled)
+        tk.Checkbutton(year_frame, text="启用年份筛选（不需要者取消勾选）", variable=self.year_enabled_var,
+                       command=self._on_year_toggle).pack(side=tk.LEFT, padx=5)
         tk.Label(year_frame, text="(输入年份如25 → 点击重建索引)", fg="gray", font=("微软雅黑", 8)).pack(side=tk.LEFT, padx=5)
+        if not settings.year_enabled:
+            # 关闭年份筛选时：清空已选年份并禁用下拉，扫描包含全部年份
+            self.selected_year_var.set("全部")
+            self.year_combo.config(state="disabled")
 
         # 目标范围框 - 紧凑布局
         range_frame = tk.LabelFrame(main_container, text="目标范围", padx=3, pady=2)

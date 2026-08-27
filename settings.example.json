@@ -18,7 +18,7 @@
     "target_subfolder": {"name": "Data"},
     "folder_match": {"prefix_match": true, "word_boundary_match": true},
     "year_rules": {"prefix_length": 4, "century_prefix": "20", "unknown_folder": "未分类"},
-    "years": {"available": []},
+    "years": {"enabled": true, "available": []},
     "ocr": {
         "languages": ["eng", "chi_sim"],
         "dpi": 400,
