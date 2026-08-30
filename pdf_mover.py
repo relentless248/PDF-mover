@@ -3,11 +3,13 @@ import re
 import shutil
 import sys
 import json
+import logging
 import threading
 import time
 import gc
 import traceback
 import uuid
+from logging.handlers import RotatingFileHandler
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog
 from datetime import datetime
@@ -20,27 +22,60 @@ from openpyxl import Workbook
 
 from core.settings import settings, reload_settings, CONFIG_FILE, INDEX_CACHE_FILE
 from core.help_text import BUILTIN_HELP
+from core.matching import (
+    extract_year_from_project_id as pure_extract_year,
+    folder_matches as pure_folder_matches,
+    unique_path as pure_unique_path,
+    unique_target_path as pure_unique_target_path,
+)
 
 # ========== 自动获取运行目录中的路径（不要修改）==========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 依赖路径（取自 settings.deps，可配置，不再写死版本号）
+# ========== 日志（运行日志写入 run.log，同时输出到控制台）==========
+def _setup_logger():
+    logger = logging.getLogger('pdf_mover')
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    try:
+        file_handler = RotatingFileHandler(
+            os.path.join(BASE_DIR, 'run.log'),
+            maxBytes=2 * 1024 * 1024, backupCount=2, encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError:
+        pass  # 日志文件不可用时仅输出到控制台
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    return logger
+
+log = _setup_logger()
+
+# ========== 依赖路径（取自 settings.deps，可配置；启动时经 verify_dependencies 校验）==========
 TESSERACT_CMD = os.path.join(BASE_DIR, settings.deps['tesseract_dir'], 'tesseract.exe')
-if not os.path.exists(TESSERACT_CMD):
-    messagebox.showerror("错误", f"找不到Tesseract，请确认路径：{TESSERACT_CMD}")
-    sys.exit(1)
+TESSDATA_DIR = os.path.join(BASE_DIR, settings.deps['tesseract_dir'], 'tessdata')
+POPPLER_PATH = os.path.join(BASE_DIR, settings.deps['poppler_dir'], 'Library', 'bin')
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
-TESSDATA_DIR = os.path.join(BASE_DIR, settings.deps['tesseract_dir'], 'tessdata')
-if not os.path.exists(TESSDATA_DIR):
-    messagebox.showerror("错误", f"找不到tessdata文件夹：{TESSDATA_DIR}\n请确保Tesseract-OCR文件夹内包含tessdata子文件夹。")
-    sys.exit(1)
-os.environ['TESSDATA_PREFIX'] = TESSDATA_DIR
+def verify_dependencies():
+    """检查本地依赖是否就绪；返回缺失项描述列表（空列表表示就绪）。
 
-POPPLER_PATH = os.path.join(BASE_DIR, settings.deps['poppler_dir'], 'Library', 'bin')
-if not os.path.exists(POPPLER_PATH):
-    messagebox.showerror("错误", f"找不到Poppler，请确认路径：{POPPLER_PATH}")
-    sys.exit(1)
+    依赖检查放在启动阶段而非导入期，避免模块导入时弹窗/退出，
+    也使主模块可被测试代码安全导入。
+    """
+    problems = []
+    if not os.path.exists(TESSERACT_CMD):
+        problems.append(f"找不到Tesseract，请确认路径：{TESSERACT_CMD}")
+    if not os.path.exists(TESSDATA_DIR):
+        problems.append(f"找不到tessdata文件夹：{TESSDATA_DIR}\n请确保Tesseract-OCR文件夹内包含tessdata子文件夹。")
+    if not os.path.exists(POPPLER_PATH):
+        problems.append(f"找不到Poppler，请确认路径：{POPPLER_PATH}")
+    if not problems:
+        os.environ['TESSDATA_PREFIX'] = TESSDATA_DIR
+    return problems
 
 # ========== 预编译正则（由 settings 统一派生；配置修改后通过 reload_derived 刷新）==========
 project_regex = settings.project_regex
@@ -59,7 +94,13 @@ def reload_derived():
     see_from_filename_regex = settings.see_from_filename_regex
 
 class AutoPauseDialog(tk.Toplevel):
-    """非模态暂停对话框（修复：关闭按钮回调）"""
+    """非模态暂停对话框（倒计时由对话框内部驱动，是唯一计时源）。
+
+    - 跳过 / 关闭(X)：立即触发 skip_callback（整个生命周期最多一次）；
+    - 立即处理：仅关闭对话框，不触发任何回调（用户转为手动处理）；
+    - 倒计时归零：自动触发 timeout_callback（仅一次）；
+    - 对话框被外部销毁时倒计时自动失效，不会误触发回调。
+    """
     def __init__(self, parent, message, timeout_callback, skip_callback, timeout=20):
         super().__init__(parent)
         self.parent = parent
@@ -67,6 +108,8 @@ class AutoPauseDialog(tk.Toplevel):
         self.skip_callback = skip_callback
         self.timeout = timeout
         self.remaining = timeout
+        self._closed = False
+        self._timer_id = None
 
         self.title("自动运行暂停")
         self.geometry("450x200")
@@ -75,6 +118,8 @@ class AutoPauseDialog(tk.Toplevel):
         self.grab_set()
         # 绑定关闭窗口事件
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        # 窗口被外部销毁时终止倒计时（Destroy 事件会对子控件冒泡，需过滤）
+        self.bind("<Destroy>", self._on_destroy)
 
         tk.Label(self, text=message, wraplength=420, justify=tk.LEFT).pack(pady=10, padx=10)
         self.timer_label = tk.Label(self, text=f"剩余 {self.remaining} 秒后将自动跳过", fg="blue")
@@ -83,31 +128,62 @@ class AutoPauseDialog(tk.Toplevel):
         btn_frame.pack(pady=10)
         tk.Button(btn_frame, text="立即处理", command=self.on_handle_now, width=15).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="跳过", command=self.on_skip, width=15).pack(side=tk.LEFT, padx=5)
-        self.update_timer()
+        self._schedule_tick()
+
+    def _schedule_tick(self):
+        self._timer_id = self.after(1000, self.update_timer)
+
+    def _cancel_tick(self):
+        if self._timer_id is not None:
+            try:
+                self.after_cancel(self._timer_id)
+            except Exception:
+                pass
+            self._timer_id = None
+
+    def _on_destroy(self, event):
+        if event.widget is self and not self._closed:
+            self._closed = True
+            self._cancel_tick()
+
+    def _fire(self, callback):
+        """触发回调；保证整个对话框生命周期内最多触发一次。"""
+        if self._closed:
+            return
+        self._closed = True
+        self._cancel_tick()
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        if callback:
+            callback()
 
     def update_timer(self):
+        self._timer_id = None
+        if self._closed:
+            return
         self.remaining -= 1
         if self.remaining <= 0:
-            self.destroy()
-            if self.timeout_callback:
-                self.timeout_callback()
+            self._fire(self.timeout_callback)
         else:
             self.timer_label.config(text=f"剩余 {self.remaining} 秒后将自动跳过")
-            self.after(1000, self.update_timer)
+            self._schedule_tick()
 
     def on_handle_now(self):
+        """立即处理：关闭对话框并停止倒计时，不触发跳过回调。"""
+        if self._closed:
+            return
+        self._closed = True
+        self._cancel_tick()
         self.destroy()
 
     def on_skip(self):
-        self.destroy()
-        if self.skip_callback:
-            self.skip_callback()
+        self._fire(self.skip_callback)
 
     def on_close(self):
         """关闭按钮点击时，视为跳过"""
-        self.destroy()
-        if self.skip_callback:
-            self.skip_callback()
+        self._fire(self.skip_callback)
 
 class PDFMoverApp:
     # ========== 工具函数 ==========
@@ -129,7 +205,7 @@ class PDFMoverApp:
         thread.join(timeout)
 
         if not is_completed[0]:
-            print(f"[超时警告] 操作执行超过{timeout}秒，已强制终止")
+            log.warning(f"[超时警告] 操作执行超过{timeout}秒，已强制终止")
             raise TimeoutError(f"操作超时，超过{timeout}秒未完成")
         if exception[0] is not None:
             raise exception[0]
@@ -153,7 +229,7 @@ class PDFMoverApp:
                 json.dump(data, f, indent=4, ensure_ascii=False)
             os.replace(temp_file, filepath)
         except Exception as e:
-            print(f"原子写入失败 {filepath}: {e}")
+            log.error(f"原子写入失败 {filepath}: {e}")
             if os.path.exists(temp_file):
                 os.remove(temp_file)
             raise
@@ -165,19 +241,19 @@ class PDFMoverApp:
             wb.save(temp_file)
             os.replace(temp_file, filepath)
         except Exception as e:
-            print(f"原子写入Excel失败 {filepath}: {e}")
+            log.error(f"原子写入Excel失败 {filepath}: {e}")
             if os.path.exists(temp_file):
                 os.remove(temp_file)
             raise
 
     # ========== 路径安全校验 ==========
     def is_target_path_valid(self, target_path):
-        """校验目标文件夹是否在允许的根目录范围内"""
-        abs_target = os.path.abspath(target_path)
+        """校验目标文件夹是否在允许的根目录范围内（Windows 下不区分大小写）"""
+        abs_target = os.path.normcase(os.path.abspath(target_path))
         for root_item in self.target_roots:
             root_path = root_item['path'] if isinstance(root_item, dict) else root_item
-            abs_root = os.path.abspath(root_path)
-            if abs_target.startswith(abs_root + os.sep) or abs_target == abs_root:
+            abs_root = os.path.normcase(os.path.abspath(root_path))
+            if abs_target == abs_root or abs_target.startswith(abs_root + os.sep):
                 return True
         return False
 
@@ -195,7 +271,7 @@ class PDFMoverApp:
                 err_str = str(e).lower()
                 # 仅对文件被占用的场景重试
                 if ("being used by another process" in err_str or "占用" in err_str) and retry < max_retries - 1:
-                    print(f"[重试] 文件被占用，第{retry+1}次重试，等待2秒... 目标: {os.path.basename(dst)}")
+                    log.warning(f"[重试] 文件被占用，第{retry+1}次重试，等待2秒... 目标: {os.path.basename(dst)}")
                     time.sleep(settings.file_ops['retry_interval_sec'])
                     continue
                 else:
@@ -203,6 +279,55 @@ class PDFMoverApp:
             except Exception as e:
                 # 其他错误（文件不存在、路径无效、权限拒绝等）直接抛出
                 raise e
+
+    def rename_with_retry(self, src, dst):
+        """带重试的重命名（仅对文件被占用的可恢复错误重试），失败抛出最后一次异常。"""
+        max_retries = settings.file_ops['retries']
+        last_error = None
+        for retry in range(max_retries):
+            try:
+                os.rename(src, dst)
+                return
+            except PermissionError as e:
+                last_error = e
+                err_str = str(e).lower()
+                if ("being used by another process" in err_str or "占用" in err_str) and retry < max_retries - 1:
+                    log.warning(f"[重试] 文件被占用，第{retry+1}次重试，等待2秒... 目标: {os.path.basename(dst)}")
+                    time.sleep(settings.file_ops['retry_interval_sec'])
+                    continue
+                raise e
+        if last_error is not None:
+            raise last_error
+
+    # ========== 共享 UI 状态清理 ==========
+    def _clear_current_file_ui(self):
+        """清除当前文件的界面状态（预览、目标文件夹与编号输入框）。"""
+        self.current_pdf = None
+        self.canvas.delete("all")
+        self.original_preview_img = None
+        self.folder_combo.set('')
+        self.correct_entry.delete(0, tk.END)
+
+    def _remove_current_from_list(self):
+        """从列表中移除当前文件并清空其界面状态。"""
+        if 0 <= self.current_index < len(self.pdf_files):
+            self.pdf_files.pop(self.current_index)
+            self.listbox.delete(self.current_index)
+        self._clear_current_file_ui()
+
+    # ========== 编号 -> 文件夹查找（缓存 + LRU） ==========
+    def _find_folders_for_id(self, project_id, use_cache=True):
+        """按编号查找匹配的项目文件夹：优先搜索缓存，未命中则线性扫描并写回缓存（LRU 淘汰）。"""
+        if use_cache and project_id in self.search_cache:
+            return self.search_cache[project_id]
+        with self.thread_lock:
+            folders = self.all_project_folders.copy()
+        matches = [f for f in folders if self.folder_matches(os.path.basename(f), project_id)]
+        self.search_cache[project_id] = matches
+        self.search_cache.move_to_end(project_id)
+        if len(self.search_cache) > settings.cache['search_max']:
+            self.search_cache.popitem(last=False)
+        return matches
 
     # ========== 按钮防护装饰器 ==========
     def button_guard(func):
@@ -283,7 +408,7 @@ class PDFMoverApp:
         for temp_file in os.listdir(self.temp_dir):
             try:
                 os.remove(os.path.join(self.temp_dir, temp_file))
-            except:
+            except OSError:
                 pass
 
         if not self.all_project_folders and self.target_roots:
@@ -396,7 +521,7 @@ class PDFMoverApp:
                         old_roots = config.get('target_roots', [])
                         roots = [{'path': r, 'depth': settings.cache['search_depth']} for r in old_roots]
                     return roots
-            except:
+            except Exception:
                 return []
         return []
 
@@ -404,7 +529,7 @@ class PDFMoverApp:
         try:
             self.atomic_write_json(CONFIG_FILE, {'roots': self.target_roots})
         except Exception as e:
-            print(f"保存配置失败: {e}")
+            log.error(f"保存配置失败: {e}")
 
     def is_cache_expired(self):
         if not os.path.exists(INDEX_CACHE_FILE):
@@ -426,7 +551,7 @@ class PDFMoverApp:
                     cached_root_keys = set(f"{r}_{settings.cache['search_depth']}" for r in cached_roots)
                 if cached_root_keys != current_root_keys:
                     return True
-        except:
+        except Exception:
             return True
         return False
 
@@ -471,7 +596,7 @@ class PDFMoverApp:
                         with self.thread_lock:
                             self.all_project_folders = data.get('folders', [])
         except Exception as e:
-            print(f"加载索引缓存失败: {e}")
+            log.error(f"加载索引缓存失败: {e}")
             with self.thread_lock:
                 self.all_project_folders = []
 
@@ -503,7 +628,7 @@ class PDFMoverApp:
                     if f.startswith('index_cache_chunk_'):
                         os.remove(os.path.join(BASE_DIR, f))
         except Exception as e:
-            print(f"保存索引缓存失败: {e}")
+            log.error(f"保存索引缓存失败: {e}")
 
     def guide_add_root(self):
         # 修正提示：askdirectory 不支持多选，改为提示可以多次添加
@@ -516,8 +641,8 @@ class PDFMoverApp:
         for filepath, (wb, _) in list(self.excel_caches.items()):
             try:
                 wb.close()
-                print(f"[缓存清理] 已关闭旧的工作簿：{filepath}")
-            except:
+                log.info(f"[缓存清理] 已关闭旧的工作簿：{filepath}")
+            except Exception:
                 pass
         self.excel_caches.clear()
 
@@ -591,13 +716,13 @@ class PDFMoverApp:
                 self.save_excel_files()
                 self.records_since_last_save = 0
         except Exception as e:
-            print(f"记录失败: {e}")
+            log.error(f"记录失败: {e}")
 
     def save_excel_files(self):
         for filepath, (wb, _) in list(self.excel_caches.items()):
             try:
                 self.atomic_write_excel(filepath, wb)
-                print(f"已自动保存: {filepath}")
+                log.info(f"已自动保存: {filepath}")
             except PermissionError:
                 response = messagebox.askyesno("文件被占用",
                     f"文件 {os.path.basename(filepath)} 正在被 Excel 打开，无法保存。\n"
@@ -612,7 +737,7 @@ class PDFMoverApp:
                     except Exception as e2:
                         messagebox.showerror("保存失败", f"无法保存备份文件：{e2}")
             except Exception as e:
-                print(f"保存 {filepath} 失败: {e}")
+                log.error(f"保存 {filepath} 失败: {e}")
 
     # ========== 年份提取与处理 ==========
     def extract_year_from_folder_name(self, folder_name):
@@ -625,14 +750,11 @@ class PDFMoverApp:
     def extract_year_from_project_id(self, project_id):
         if not project_id:
             return None
-        prefix_len = settings.year_rules.get('prefix_length', 4)
-        century = settings.year_rules.get('century_prefix', '20')
-        number_part = project_id[prefix_len:] if len(project_id) > prefix_len else project_id
-        if len(number_part) >= 4 and number_part[:2] == century:
-            return number_part[2:4]
-        elif len(number_part) >= 2:
-            return number_part[:2]
-        return None
+        return pure_extract_year(
+            project_id,
+            prefix_length=settings.year_rules.get('prefix_length', 4),
+            century_prefix=settings.year_rules.get('century_prefix', '20'),
+        )
 
     def on_year_changed(self, event):
         self.status_var.set(f"已切换年份为：{self.selected_year_var.get()}，请点击「重建索引」以更新文件夹列表")
@@ -774,7 +896,7 @@ class PDFMoverApp:
                         continue
         except Exception as e:
             self.error_count += 1
-            print(f"遍历目录 {current_path} 时出错: {e}")
+            log.warning(f"遍历目录 {current_path} 时出错: {e}")
         return folders
 
     def build_folder_index_thread(self):
@@ -888,7 +1010,7 @@ class PDFMoverApp:
                 def confirm_depth():
                     try:
                         depth = int(depth_var.get())
-                    except:
+                    except ValueError:
                         depth = settings.cache['search_depth']
                     self.target_roots.append({'path': folder, 'depth': depth})
                     display_text = f"{folder:.<60}  [{depth}层]"
@@ -934,7 +1056,7 @@ class PDFMoverApp:
         def confirm_edit():
             try:
                 new_depth = int(depth_var.get())
-            except:
+            except ValueError:
                 new_depth = settings.cache['search_depth']
             self.target_roots[index]['depth'] = new_depth
             # 更新列表显示
@@ -950,7 +1072,7 @@ class PDFMoverApp:
                 for f in os.listdir(BASE_DIR):
                     if f.startswith('index_cache_chunk_'):
                         os.remove(os.path.join(BASE_DIR, f))
-            except:
+            except OSError:
                 pass
         
         btn_frame = tk.Frame(depth_dialog)
@@ -981,7 +1103,7 @@ class PDFMoverApp:
                 if f.startswith('index_cache_chunk_'):
                     os.remove(os.path.join(BASE_DIR, f))
         except Exception as e:
-            print(f"[缓存清理] 删除缓存文件失败：{e}")
+            log.warning(f"[缓存清理] 删除缓存文件失败：{e}")
         with self.thread_lock:
             self.all_project_folders = []
             self.search_cache.clear()
@@ -998,7 +1120,7 @@ class PDFMoverApp:
                 if f.startswith('index_cache_chunk_'):
                     os.remove(os.path.join(BASE_DIR, f))
         except Exception as e:
-            print(f"[缓存清理] 删除缓存失败：{e}")
+            log.warning(f"[缓存清理] 删除缓存失败：{e}")
         with self.thread_lock:
             self.search_cache.clear()
             self.ocr_cache.clear()
@@ -1134,7 +1256,7 @@ class PDFMoverApp:
 
     def auto_run_next(self):
         if self.processing:
-            print(f"[自动运行] 文件处理中，1秒后重试...")
+            log.info(f"[自动运行] 文件处理中，1秒后重试...")
             self.root.after(1000, self.auto_run_next)
             return
         if not self.auto_run or self.auto_run_paused:
@@ -1163,8 +1285,9 @@ class PDFMoverApp:
         self.auto_run_paused = True
         self.cancel_auto_timer()
         self.close_pause_dialog()
+        # 倒计时由对话框内部驱动（唯一计时源）：到点自动跳过；
+        # 「立即处理」会终止倒计时，不再有外层定时器残留误触发的问题
         self.pause_dialog = AutoPauseDialog(self.root, message, skip_callback, skip_callback, 20)
-        self.auto_timer_id = self.root.after(20000, skip_callback)
 
     # ========== 安全PDF路径处理（临时文件+自动清理）==========
     def get_safe_pdf_path(self, pdf_path):
@@ -1183,7 +1306,7 @@ class PDFMoverApp:
             shutil.copy2(pdf_path, safe_path)
             return safe_path, True
         except Exception as e:
-            print(f"[警告] 无法创建临时文件，尝试直接处理: {e}")
+            log.warning(f"[警告] 无法创建临时文件，尝试直接处理: {e}")
             return pdf_path, False
 
     # ========== 自动复制到多个文件夹 ==========
@@ -1204,11 +1327,7 @@ class PDFMoverApp:
                 if not self.is_target_path_valid(testdata_folder):
                     error_folders.append((testdata_folder, "目标文件夹不在允许范围内"))
                     continue
-                target_path = os.path.join(testdata_folder, f"{settings.target_filename}.pdf")
-                counter = 1
-                while os.path.exists(target_path):
-                    target_path = os.path.join(testdata_folder, f"{settings.target_filename}_{counter}.pdf")
-                    counter += 1
+                target_path = pure_unique_target_path(testdata_folder, settings.target_filename)
                 try:
                     self.perform_file_operation(pdf_path, target_path, is_copy=True)
                     copied_count += 1
@@ -1232,13 +1351,7 @@ class PDFMoverApp:
                     if not self.no_intervene_var.get():
                         messagebox.showerror("删除失败", f"无法删除原文件 {os.path.basename(pdf_path)}: {e}")
             if pdf_path == self.current_pdf:
-                self.pdf_files.pop(self.current_index)
-                self.listbox.delete(self.current_index)
-                self.current_pdf = None
-                self.canvas.delete("all")
-                self.original_preview_img = None
-                self.folder_combo.set('')
-                self.correct_entry.delete(0, tk.END)
+                self._remove_current_from_list()
                 self.status_var.set(f"已自动复制到 {copied_count}/{len(target_testdata_folders)} 个 Test Data 文件夹")
             else:
                 try:
@@ -1249,7 +1362,7 @@ class PDFMoverApp:
                     pass
             self.handle_auto_run_after_action(removed=True)
         except Exception as e:
-            print(f"[错误] 自动复制到多文件夹失败: {traceback.format_exc()}")
+            log.error(f"[错误] 自动复制到多文件夹失败: {traceback.format_exc()}")
             if self.no_intervene_var.get():
                 self.auto_skip_no_folder_keep(pdf_path, project_id)
             else:
@@ -1272,39 +1385,20 @@ class PDFMoverApp:
                 final_name = settings.build_filename('see_relation', see_id=see_id, project_id=project_id)
             else:
                 final_name = settings.build_filename('unidentified', original=old_name)
-            new_path = os.path.join(dir_name, final_name)
+            new_path = pure_unique_path(os.path.join(dir_name, final_name))
             # 安全校验：重命名后的文件仍在源文件夹内，无需额外校验
-            counter = 1
-            base, ext = os.path.splitext(new_path)
-            while os.path.exists(new_path):
-                new_path = os.path.join(dir_name, f"{base}_{counter}{ext}")
-                counter += 1
-            max_retries = settings.file_ops['retries']
             rename_success = False
             last_error = None
-            for retry in range(max_retries):
-                try:
-                    os.rename(old_path, new_path)
-                    rename_success = True
-                    break
-                except PermissionError as e:
-                    last_error = e
-                    if "being used by another process" in str(e).lower() and retry < max_retries - 1:
-                        time.sleep(settings.file_ops['retry_interval_sec'])
-                        continue
-                    else:
-                        raise e
+            try:
+                self.rename_with_retry(old_path, new_path)
+                rename_success = True
+            except Exception as e:
+                last_error = e
             if not rename_success:
                 if self.no_intervene_var.get():
-                    print(f"[不干预模式] 重命名失败，跳过文件: {old_name}")
+                    log.info(f"[不干预模式] 重命名失败，跳过文件: {old_name}")
                     if remove and pdf_path == self.current_pdf:
-                        self.pdf_files.pop(self.current_index)
-                        self.listbox.delete(self.current_index)
-                        self.current_pdf = None
-                        self.canvas.delete("all")
-                        self.original_preview_img = None
-                        self.folder_combo.set('')
-                        self.correct_entry.delete(0, tk.END)
+                        self._remove_current_from_list()
                     if self.auto_run:
                         self.handle_auto_run_after_action(removed=remove)
                     return
@@ -1314,20 +1408,14 @@ class PDFMoverApp:
             self.append_record(self.not_found_excel, [timestamp, old_name, final_name, project_id or ''])
             if remove:
                 if pdf_path == self.current_pdf:
-                    self.pdf_files.pop(self.current_index)
-                    self.listbox.delete(self.current_index)
-                    self.current_pdf = None
-                    self.canvas.delete("all")
-                    self.original_preview_img = None
-                    self.folder_combo.set('')
-                    self.correct_entry.delete(0, tk.END)
+                    self._remove_current_from_list()
                     self.status_var.set(f"已自动重命名: {final_name}")
                 else:
                     try:
                         idx = self.pdf_files.index(old_path)
                         self.pdf_files.pop(idx)
                         self.listbox.delete(idx)
-                    except:
+                    except Exception:
                         pass
             else:
                 if pdf_path == self.current_pdf:
@@ -1343,7 +1431,7 @@ class PDFMoverApp:
                         self.pdf_files[idx] = new_path
                         self.listbox.delete(idx)
                         self.listbox.insert(idx, final_name)
-                    except:
+                    except Exception:
                         pass
             if self.auto_run:
                 self.handle_auto_run_after_action(removed=remove)
@@ -1379,42 +1467,26 @@ class PDFMoverApp:
     # ========== 处理 see 关联归档 ==========
     def auto_handle_see_relation(self, pdf_path, original_id, see_id):
         try:
-            print(f"[see关联] 处理原项目 {original_id} 的关联项目 {see_id}")
-            matches = []
-            if see_id in self.search_cache:
-                matches = self.search_cache[see_id]
-            else:
-                with self.thread_lock:
-                    folders = self.all_project_folders.copy()
-                for folder in folders:
-                    if self.folder_matches(os.path.basename(folder), see_id):
-                        matches.append(folder)
-                self.search_cache[see_id] = matches
-                self.search_cache.move_to_end(see_id)
-                if len(self.search_cache) > settings.cache['search_max']:
-                    self.search_cache.popitem(last=False)
+            log.info(f"[see关联] 处理原项目 {original_id} 的关联项目 {see_id}")
+            matches = self._find_folders_for_id(see_id)
             if len(matches) != 1:
-                print(f"[see关联] 关联项目 {see_id} 匹配到 {len(matches)} 个文件夹，归档失败")
+                log.warning(f"[see关联] 关联项目 {see_id} 匹配到 {len(matches)} 个文件夹，归档失败")
                 self.auto_skip_no_testdata_with_see(pdf_path, original_id, see_id)
                 return
             project_folder = matches[0]
             test_data_folders = self.find_test_data_folders(project_folder)
             if len(test_data_folders) != 1:
-                print(f"[see关联] 关联项目 {see_id} 下找到 {len(test_data_folders)} 个Test Data，归档失败")
+                log.warning(f"[see关联] 关联项目 {see_id} 下找到 {len(test_data_folders)} 个Test Data，归档失败")
                 self.auto_skip_no_testdata_with_see(pdf_path, original_id, see_id)
                 return
             target_folder = test_data_folders[0]
             if not self.is_target_path_valid(target_folder):
-                print(f"[see关联] 目标文件夹不在允许范围内: {target_folder}")
+                log.warning(f"[see关联] 目标文件夹不在允许范围内: {target_folder}")
                 self.auto_skip_no_testdata_with_see(pdf_path, original_id, see_id)
                 return
             is_multi = self.multi_project_var.get()
             file_name = os.path.basename(pdf_path)
-            target_path = os.path.join(target_folder, f"{settings.target_filename}.pdf")
-            counter = 1
-            while os.path.exists(target_path):
-                target_path = os.path.join(target_folder, f"{settings.target_filename}_{counter}.pdf")
-                counter += 1
+            target_path = pure_unique_target_path(target_folder, settings.target_filename)
             self.perform_file_operation(pdf_path, target_path, is_copy=is_multi)
             project_id_display = f"{original_id}(关联{see_id})"
             op_type = '复制(关联)' if is_multi else '移动(关联)'
@@ -1425,17 +1497,11 @@ class PDFMoverApp:
                 self.current_index += 1
                 self.root.after(500, self.auto_run_next)
             else:
-                self.pdf_files.pop(self.current_index)
-                self.listbox.delete(self.current_index)
-                self.current_pdf = None
-                self.canvas.delete("all")
-                self.original_preview_img = None
-                self.folder_combo.set('')
-                self.correct_entry.delete(0, tk.END)
+                self._remove_current_from_list()
                 self.status_var.set("就绪")
                 self.handle_auto_run_after_action(removed=True)
         except Exception as e:
-            print(f"[错误] auto_handle_see_relation 异常: {traceback.format_exc()}")
+            log.error(f"[错误] auto_handle_see_relation 异常: {traceback.format_exc()}")
             self.auto_skip_no_testdata_with_see(pdf_path, original_id, see_id)
 
     # ========== 多项目号自动处理（含对账表记录）==========
@@ -1461,19 +1527,7 @@ class PDFMoverApp:
                 current_status = "失败"
                 current_remark = ""
 
-                matches = []
-                if project_id in self.search_cache:
-                    matches = self.search_cache[project_id]
-                else:
-                    with self.thread_lock:
-                        folders = self.all_project_folders.copy()
-                    for folder in folders:
-                        if self.folder_matches(os.path.basename(folder), project_id):
-                            matches.append(folder)
-                    self.search_cache[project_id] = matches
-                    self.search_cache.move_to_end(project_id)
-                    if len(self.search_cache) > settings.cache['search_max']:
-                        self.search_cache.popitem(last=False)
+                matches = self._find_folders_for_id(project_id)
 
                 if len(matches) != 1:
                     fail_count += 1
@@ -1497,11 +1551,7 @@ class PDFMoverApp:
                             current_remark = f"目标文件夹不在允许范围: {target_folder}"
                         else:
                             try:
-                                target_path = os.path.join(target_folder, f"{settings.target_filename}.pdf")
-                                counter = 1
-                                while os.path.exists(target_path):
-                                    target_path = os.path.join(target_folder, f"{settings.target_filename}_{counter}.pdf")
-                                    counter += 1
+                                target_path = pure_unique_target_path(target_folder, settings.target_filename)
                                 self.perform_file_operation(pdf_path, target_path, is_copy=True)
 
                                 current_status = "成功"
@@ -1525,40 +1575,29 @@ class PDFMoverApp:
                 ]
                 self.append_record(self.reconciliation_excel, recon_data)
 
-            print(f"[多项目处理] 完成！成功：{success_count}，失败：{fail_count}")
+            log.info(f"[多项目处理] 完成！成功：{success_count}，失败：{fail_count}")
 
             if success_count > 0:
                 try:
                     old_path = pdf_path
                     dir_name = os.path.dirname(old_path)
                     new_name = settings.build_filename('multi_project', original=file_name)
-                    new_path = os.path.join(dir_name, new_name)
-                    counter = 1
-                    base, ext = os.path.splitext(new_path)
-                    while os.path.exists(new_path):
-                        new_path = os.path.join(dir_name, f"{base}_{counter}{ext}")
-                        counter += 1
-                    os.rename(old_path, new_path)
+                    new_path = pure_unique_path(os.path.join(dir_name, new_name))
+                    self.rename_with_retry(old_path, new_path)
 
-                    self.pdf_files.pop(self.current_index)
-                    self.listbox.delete(self.current_index)
-                    self.current_pdf = None
-                    self.canvas.delete("all")
-                    self.original_preview_img = None
-                    self.folder_combo.set('')
-                    self.correct_entry.delete(0, tk.END)
+                    self._remove_current_from_list()
                     self.status_var.set(f"多项目处理完成：成功{success_count}个，失败{fail_count}个")
                 except Exception as e:
-                    print(f"[多项目处理] 重命名原文件失败：{str(e)}")
+                    log.error(f"[多项目处理] 重命名原文件失败：{str(e)}")
                     self.current_index += 1
             else:
-                print(f"[多项目处理] 全部失败，按未找到项目处理")
+                log.info(f"[多项目处理] 全部失败，按未找到项目处理")
                 representative_id = clean_project_ids[0] if clean_project_ids else None
                 self.auto_skip_no_folder_keep(pdf_path, representative_id)
                 return
             self.handle_auto_run_after_action(removed=True)
         except Exception as e:
-            print(f"[错误] auto_handle_multi_projects 异常: {traceback.format_exc()}")
+            log.error(f"[错误] auto_handle_multi_projects 异常: {traceback.format_exc()}")
             if self.no_intervene_var.get():
                 self.auto_skip_no_folder_keep(self.current_pdf, None)
             else:
@@ -1578,7 +1617,7 @@ class PDFMoverApp:
                 if not getattr(self, '_auto_rotation_attempted', False):
                     self._auto_rotation_attempted = True
                     step = settings.ocr.get('rotate_step', 90) or 90
-                    print(f"[自动旋转] 未识别到项目编号，尝试旋转{step}°重新识别：{os.path.basename(self.current_pdf)}")
+                    log.info(f"[自动旋转] 未识别到项目编号，尝试旋转{step}°重新识别：{os.path.basename(self.current_pdf)}")
                     self.rotation_angle = (self.rotation_angle + step) % 360
                     self.processing = True
                     thread = threading.Thread(target=self.process_pdf_thread, args=(self.current_pdf, self.rotation_angle), daemon=True)
@@ -1587,7 +1626,7 @@ class PDFMoverApp:
                 else:
                     # 已经尝试过旋转，仍无编号，则清除标记并进入后续处理
                     self._auto_rotation_attempted = False
-                    print(f"[自动旋转] 旋转后仍无编号，进入未识别处理流程")
+                    log.info(f"[自动旋转] 旋转后仍无编号，进入未识别处理流程")
 
             # 重置旋转尝试标记（当成功识别或进入下一文件时）
             self._auto_rotation_attempted = False
@@ -1597,20 +1636,8 @@ class PDFMoverApp:
             not_found_match = self.analyze_no_see_pattern.match(filename)
             if not_found_match:
                 project_id = not_found_match.group(1)
-                print(f"[自动归档] 检测到之前未找到的项目文件：{filename}，提取编号：{project_id}")
-                matches = []
-                if project_id in self.search_cache:
-                    matches = self.search_cache[project_id]
-                else:
-                    with self.thread_lock:
-                        folders = self.all_project_folders.copy()
-                    for folder in folders:
-                        if self.folder_matches(os.path.basename(folder), project_id):
-                            matches.append(folder)
-                    self.search_cache[project_id] = matches
-                    self.search_cache.move_to_end(project_id)
-                    if len(self.search_cache) > settings.cache['search_max']:
-                        self.search_cache.popitem(last=False)
+                log.info(f"[自动归档] 检测到之前未找到的项目文件：{filename}，提取编号：{project_id}")
+                matches = self._find_folders_for_id(project_id)
 
                 if len(matches) == 1:
                     project_folder = matches[0]
@@ -1618,34 +1645,23 @@ class PDFMoverApp:
                     if len(test_data_folders) == 1:
                         target_folder = test_data_folders[0]
                         if not self.is_target_path_valid(target_folder):
-                            print(f"[自动归档] 目标文件夹不在允许范围: {target_folder}")
+                            log.warning(f"[自动归档] 目标文件夹不在允许范围: {target_folder}")
                         else:
-                            target_filename = f"{settings.target_filename}.pdf"
-                            target_path = os.path.join(target_folder, target_filename)
-                            counter = 1
-                            while os.path.exists(target_path):
-                                target_path = os.path.join(target_folder, f"{settings.target_filename}_{counter}.pdf")
-                                counter += 1
+                            target_path = pure_unique_target_path(target_folder, settings.target_filename)
                             try:
                                 self.perform_file_operation(self.current_pdf, target_path, is_copy=False)
                                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                                 self.append_record(self.saved_excel, [timestamp, filename, project_id, target_folder, '自动归档未找到项目'])
-                                self.pdf_files.pop(self.current_index)
-                                self.listbox.delete(self.current_index)
-                                self.current_pdf = None
-                                self.canvas.delete("all")
-                                self.original_preview_img = None
-                                self.folder_combo.set('')
-                                self.correct_entry.delete(0, tk.END)
+                                self._remove_current_from_list()
                                 self.status_var.set(f"已自动归档之前未找到的项目：{filename}")
                                 self.handle_auto_run_after_action(removed=True)
                                 return
                             except Exception as e:
-                                print(f"[错误] 自动归档失败：{e}")
+                                log.error(f"[错误] 自动归档失败：{e}")
                     else:
-                        print(f"[自动归档] 项目 {project_id} 的 Test Data 数量异常 ({len(test_data_folders)} 个)，跳过")
+                        log.info(f"[自动归档] 项目 {project_id} 的 Test Data 数量异常 ({len(test_data_folders)} 个)，跳过")
                 else:
-                    print(f"[自动归档] 项目 {project_id} 匹配到 {len(matches)} 个文件夹，跳过")
+                    log.info(f"[自动归档] 项目 {project_id} 匹配到 {len(matches)} 个文件夹，跳过")
 
             project_id_clean = self.correct_entry.get().strip()
             if project_id_clean and len(self.matched_folders) == 0:
@@ -1670,7 +1686,7 @@ class PDFMoverApp:
                 else:
                     self.show_pause_dialog(
                         f"文件【{file_name}】\n未识别到项目编号，即将自动重命名为“未识别_原文件名”并记录到“未找到项目”",
-                        lambda: self.auto_skip_no_id(self.current_pdf)
+                        lambda p=self.current_pdf: self.auto_skip_no_id(p)
                     )
                     return
             if len(self.matched_folders) == 0:
@@ -1680,7 +1696,7 @@ class PDFMoverApp:
                 else:
                     self.show_pause_dialog(
                         f"文件【{file_name}】\n未找到项目[{project_id}]的匹配文件夹，即将自动重命名为“未找到项目_{project_id}.pdf”并记录到“未找到项目”",
-                        lambda: self.auto_skip_no_folder_keep(self.current_pdf, project_id)
+                        lambda p=self.current_pdf, pid=project_id: self.auto_skip_no_folder_keep(p, pid)
                     )
                     return
             elif len(self.matched_folders) > 1:
@@ -1701,7 +1717,7 @@ class PDFMoverApp:
                 else:
                     self.show_pause_dialog(
                         f"文件【{file_name}】\n项目[{project_id}]下找到{len(test_data_folders)}个Test Data文件夹，请手动选择",
-                        lambda: self.auto_skip_no_folder_keep(self.current_pdf, project_id)
+                        lambda p=self.current_pdf, pid=project_id: self.auto_skip_no_folder_keep(p, pid)
                     )
                     return
             see_ids = self.current_all_see_ids
@@ -1717,7 +1733,7 @@ class PDFMoverApp:
                 else:
                     self.show_pause_dialog(
                         f"文件【{file_name}】\n项目[{project_id}]下无Test Data，即将重命名为“未找到项目_{project_id}.pdf”并保留列表",
-                        lambda: self.auto_skip_no_folder_keep(self.current_pdf, project_id)
+                        lambda p=self.current_pdf, pid=project_id: self.auto_skip_no_folder_keep(p, pid)
                     )
                     return
             valid_see_ids = [sid for sid in see_ids if sid.strip() and sid.strip() != project_id]
@@ -1727,19 +1743,13 @@ class PDFMoverApp:
                 else:
                     self.show_pause_dialog(
                         f"文件【{file_name}】\n识别到的关联编号和原项目重复，即将重命名为“未找到项目_{project_id}.pdf”并保留列表",
-                        lambda: self.auto_skip_no_folder_keep(self.current_pdf, project_id)
+                        lambda p=self.current_pdf, pid=project_id: self.auto_skip_no_folder_keep(p, pid)
                     )
                 return
             all_see_matched_folders = []
             for see_id in valid_see_ids:
-                if see_id in self.search_cache:
-                    del self.search_cache[see_id]
-                see_matches = []
-                with self.thread_lock:
-                    folders = self.all_project_folders.copy()
-                for folder in folders:
-                    if self.folder_matches(os.path.basename(folder), see_id):
-                        see_matches.append(folder)
+                # 强制重新扫描（不走缓存），确保关联号匹配结果最新
+                see_matches = self._find_folders_for_id(see_id, use_cache=False)
                 if see_matches:
                     all_see_matched_folders.extend(see_matches)
             if not all_see_matched_folders:
@@ -1748,7 +1758,7 @@ class PDFMoverApp:
                 else:
                     self.show_pause_dialog(
                         f"文件【{file_name}】\n项目[{project_id}]下无Test Data，关联项目[{valid_see_ids[0]}]未找到匹配文件夹，即将重命名为“关联{valid_see_ids[0]}_未找到项目_{project_id}.pdf”并保留列表",
-                        lambda: self.auto_skip_no_testdata_with_see(self.current_pdf, project_id, valid_see_ids[0])
+                        lambda p=self.current_pdf, pid=project_id, sid=valid_see_ids[0]: self.auto_skip_no_testdata_with_see(p, pid, sid)
                     )
                 return
             self.auto_copy_to_multiple_folders(
@@ -1757,7 +1767,7 @@ class PDFMoverApp:
                 all_see_matched_folders
             )
         except Exception as e:
-            print(f"[错误] auto_check_and_process 异常: {traceback.format_exc()}")
+            log.error(f"[错误] auto_check_and_process 异常: {traceback.format_exc()}")
             if self.no_intervene_var.get():
                 self.auto_skip_no_folder_keep(self.current_pdf, None)
             else:
@@ -1770,11 +1780,7 @@ class PDFMoverApp:
             project_id = self.correct_entry.get().strip()
             if not self.is_target_path_valid(target_folder):
                 raise Exception("目标文件夹不在允许的根目录范围内")
-            target_path = os.path.join(target_folder, f"{settings.target_filename}.pdf")
-            counter = 1
-            while os.path.exists(target_path):
-                target_path = os.path.join(target_folder, f"{settings.target_filename}_{counter}.pdf")
-                counter += 1
+            target_path = pure_unique_target_path(target_folder, settings.target_filename)
             self.perform_file_operation(pdf_path, target_path, is_copy=is_multi)
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.append_record(self.saved_excel, [timestamp, os.path.basename(pdf_path),
@@ -1784,13 +1790,7 @@ class PDFMoverApp:
                 self.current_index += 1
                 self.root.after(500, self.auto_run_next)
             else:
-                self.pdf_files.pop(self.current_index)
-                self.listbox.delete(self.current_index)
-                self.current_pdf = None
-                self.canvas.delete("all")
-                self.original_preview_img = None
-                self.folder_combo.set('')
-                self.correct_entry.delete(0, tk.END)
+                self._remove_current_from_list()
                 self.status_var.set("就绪")
                 self.handle_auto_run_after_action(removed=True)
         except Exception as e:
@@ -1840,7 +1840,7 @@ class PDFMoverApp:
                 if is_temp and os.path.exists(safe_path):
                     try:
                         os.remove(safe_path)
-                    except:
+                    except OSError:
                         pass
             if not images:
                 raise Exception("PDF无有效页面")
@@ -1933,7 +1933,7 @@ class PDFMoverApp:
                 if is_temp and os.path.exists(safe_path):
                     try:
                         os.remove(safe_path)
-                    except:
+                    except OSError:
                         pass
             if not images:
                 raise Exception("无法获取PDF页面")
@@ -2249,7 +2249,7 @@ class PDFMoverApp:
                 if is_temp and os.path.exists(safe_path):
                     try:
                         os.remove(safe_path)
-                    except:
+                    except OSError:
                         pass
 
             if not images:
@@ -2258,8 +2258,7 @@ class PDFMoverApp:
             img = images[0]
             if angle != 0:
                 img = img.rotate(angle, expand=True)
-            self.original_preview_img = img.copy()
-            self.update_canvas_image()
+            self._show_preview_image(img)
 
             cache_key = self.get_ocr_cache_key(pdf_path)
             if cache_key in self.ocr_cache and angle == 0:
@@ -2272,37 +2271,11 @@ class PDFMoverApp:
                     if len(self.ocr_cache) > settings.cache['ocr_max']:
                         self.ocr_cache.popitem(last=False)
 
-            self.current_text = text
-            print(f"[OCR调试] 识别完成，文本长度：{len(self.current_text)} 字符")
-
-            self.current_all_project_ids = self.extract_all_project_ids(text)
-            self.current_all_see_ids = self.extract_all_see_ids(text)
-
-            final_project_id = None
-            if self.current_all_project_ids:
-                final_project_id = self.current_all_project_ids[0]
-            elif self.current_all_see_ids:
-                final_project_id = self.current_all_see_ids[0]
-
-            if not final_project_id:
-                see_id_from_filename = self.extract_see_from_filename(os.path.basename(pdf_path))
-                if see_id_from_filename:
-                    final_project_id = see_id_from_filename
-
-            if final_project_id:
-                self.correct_entry.delete(0, tk.END)
-                self.correct_entry.insert(0, final_project_id)
-                self.search_folders(final_project_id, is_auto_mode=self.auto_run)
-            else:
-                self.status_var.set("未识别到项目编号和关联编号，请手动输入")
-                if not self.auto_run:
-                    messagebox.showwarning("未识别", "未能从PDF中识别出项目编号和关联编号，请手动输入后点击'重新匹配'")
-                if self.auto_run and not self.auto_run_paused:
-                    self.root.after(0, self.auto_check_and_process)
+            self._apply_ocr_results(pdf_path, text)
 
         except TimeoutError as e:
             error_msg = f"生成预览超时：{str(e)}"
-            print(f"[预览超时] 文件：{os.path.basename(pdf_path)} | {error_msg}")
+            log.warning(f"[预览超时] 文件：{os.path.basename(pdf_path)} | {error_msg}")
             self.processing = False
             if self.auto_run:
                 self.on_ocr_error(error_msg, pdf_path)
@@ -2310,18 +2283,53 @@ class PDFMoverApp:
                 messagebox.showerror("处理失败", error_msg)
         except Exception as e:
             error_msg = f"生成预览或OCR时出错：{str(e)}"
-            print(f"[预览错误] 文件：{os.path.basename(pdf_path)} | {error_msg}")
+            log.error(f"[预览错误] 文件：{os.path.basename(pdf_path)} | {error_msg}")
             self.processing = False
             if self.auto_run:
                 self.on_ocr_error(error_msg, pdf_path)
             else:
                 messagebox.showerror("处理失败", error_msg)
 
+    def _show_preview_image(self, img):
+        """将已渲染（并按需旋转）的首页图片显示到预览画布。"""
+        self.original_preview_img = img.copy()
+        self.update_canvas_image()
+
+    def _apply_ocr_results(self, pdf_path, text):
+        """根据 OCR 文本提取编号并触发搜索 / 自动处理（渲染完成后共用入口）。"""
+        self.current_text = text
+        log.debug(f"[OCR调试] 识别完成，文本长度：{len(self.current_text)} 字符")
+
+        self.current_all_project_ids = self.extract_all_project_ids(text)
+        self.current_all_see_ids = self.extract_all_see_ids(text)
+
+        final_project_id = None
+        if self.current_all_project_ids:
+            final_project_id = self.current_all_project_ids[0]
+        elif self.current_all_see_ids:
+            final_project_id = self.current_all_see_ids[0]
+
+        if not final_project_id:
+            see_id_from_filename = self.extract_see_from_filename(os.path.basename(pdf_path))
+            if see_id_from_filename:
+                final_project_id = see_id_from_filename
+
+        if final_project_id:
+            self.correct_entry.delete(0, tk.END)
+            self.correct_entry.insert(0, final_project_id)
+            self.search_folders(final_project_id, is_auto_mode=self.auto_run)
+        else:
+            self.status_var.set("未识别到项目编号和关联编号，请手动输入")
+            if not self.auto_run:
+                messagebox.showwarning("未识别", "未能从PDF中识别出项目编号和关联编号，请手动输入后点击'重新匹配'")
+            if self.auto_run and not self.auto_run_paused:
+                self.root.after(0, self.auto_check_and_process)
+
     def process_pdf_thread(self, pdf_path, angle):
         try:
             safe_path, is_temp = self.get_safe_pdf_path(pdf_path)
             try:
-                print(f"[OCR调试] 开始转换PDF：{os.path.basename(pdf_path)}")
+                log.debug(f"[OCR调试] 开始转换PDF：{os.path.basename(pdf_path)}")
                 images = self.run_with_timeout(
                     convert_from_path,
                     args=(safe_path,),
@@ -2340,7 +2348,7 @@ class PDFMoverApp:
                 if is_temp and os.path.exists(safe_path):
                     try:
                         os.remove(safe_path)
-                    except:
+                    except OSError:
                         pass
 
             if not images:
@@ -2356,7 +2364,7 @@ class PDFMoverApp:
                 rotated_images.append(img)
 
             full_text = ""
-            print(f"[OCR调试] 开始OCR识别（角度：{angle}°）：{os.path.basename(pdf_path)}")
+            log.debug(f"[OCR调试] 开始OCR识别（角度：{angle}°）：{os.path.basename(pdf_path)}")
             for i, img in enumerate(rotated_images):
                 page_text = self.run_with_timeout(
                     pytesseract.image_to_string,
@@ -2373,33 +2381,42 @@ class PDFMoverApp:
                 if len(self.ocr_cache) > settings.cache['ocr_max']:
                     self.ocr_cache.popitem(last=False)
 
-            self.root.after(0, self.on_ocr_done, full_text, pdf_path)
+            # 把已渲染（并已旋转）的首页一并传回，避免 UI 线程重新渲染一遍
+            first_page_img = rotated_images[0] if rotated_images else None
+            self.root.after(0, self.on_ocr_done, full_text, pdf_path, first_page_img)
 
         except TimeoutError as e:
-            print(f"[OCR超时] 文件：{os.path.basename(pdf_path)} | 错误：{str(e)}")
+            log.warning(f"[OCR超时] 文件：{os.path.basename(pdf_path)} | 错误：{str(e)}")
             self.root.after(0, self.on_ocr_error, f"文件处理超时，已跳过", pdf_path)
         except Exception as e:
-            print(f"[OCR异常] 文件：{os.path.basename(pdf_path)} | 错误：{traceback.format_exc()}")
+            log.error(f"[OCR异常] 文件：{os.path.basename(pdf_path)} | 错误：{traceback.format_exc()}")
             self.root.after(0, self.on_ocr_error, str(e), pdf_path)
 
-    def on_ocr_done(self, text, pdf_path):
+    def on_ocr_done(self, text, pdf_path, first_page_img=None):
         self.current_text = text
-        self.generate_thumbnail_and_ocr(pdf_path, self.rotation_angle)
-        self.processing = False
+        try:
+            if first_page_img is not None:
+                # 直接复用 OCR 线程渲染的首页图片，省去第二次 400 DPI 渲染
+                self._show_preview_image(first_page_img)
+                self._apply_ocr_results(pdf_path, text)
+            else:
+                self.generate_thumbnail_and_ocr(pdf_path, self.rotation_angle)
+        finally:
+            self.processing = False
 
     def on_ocr_error(self, error_msg, pdf_path):
         self.status_var.set(f"OCR出错: {error_msg}")
-        print(f"[错误] OCR出错: {error_msg}，文件：{os.path.basename(pdf_path)}")
+        log.error(f"[错误] OCR出错: {error_msg}，文件：{os.path.basename(pdf_path)}")
         self.processing = False
         if self.auto_run:
             if self.no_intervene_var.get():
-                print(f"[不干预模式] OCR失败，自动跳过文件：{os.path.basename(pdf_path)}")
+                log.info(f"[不干预模式] OCR失败，自动跳过文件：{os.path.basename(pdf_path)}")
                 if pdf_path == self.current_pdf:
                     try:
                         idx = self.pdf_files.index(pdf_path)
                         self.pdf_files.pop(idx)
                         self.listbox.delete(idx)
-                    except:
+                    except Exception:
                         pass
                 self.handle_auto_run_after_action(removed=True)
             else:
@@ -2418,12 +2435,12 @@ class PDFMoverApp:
         return match.group(1).strip() if match else None
 
     def folder_matches(self, folder_name, project_id):
-        if settings.folder_match.get('prefix_match', True) and folder_name.lower().startswith(project_id.lower()):
-            return True
-        if settings.folder_match.get('word_boundary_match', True):
-            pattern = r'(?:^|\W)' + re.escape(project_id) + r'(?:$|\W)'
-            return re.search(pattern, folder_name, re.IGNORECASE) is not None
-        return False
+        fm = settings.folder_match
+        return pure_folder_matches(
+            folder_name, project_id,
+            prefix_match=fm.get('prefix_match', True),
+            word_boundary_match=fm.get('word_boundary_match', True),
+        )
 
     def search_folders(self, project_id, is_auto_mode=False, force_refresh=False):
         project_id_clean = project_id.strip()
@@ -2436,7 +2453,7 @@ class PDFMoverApp:
             self.search_timer = None
         if force_refresh and project_id_clean in self.search_cache:
             del self.search_cache[project_id_clean]
-            print(f"[搜索调试] 强制刷新，已清除缓存：{project_id_clean}")
+            log.debug(f"[搜索调试] 强制刷新，已清除缓存：{project_id_clean}")
         self.matched_folders = []
         self.root.after(0, lambda: self._update_folder_combo([]))
         self.status_var.set(f"正在搜索项目: {project_id_clean}...")
@@ -2445,7 +2462,7 @@ class PDFMoverApp:
 
     def _do_search_folders(self, project_id_clean):
         try:
-            print(f"[搜索调试] 执行搜索 | 干净项目号：{repr(project_id_clean)} | 自动模式：{self.auto_run}")
+            log.debug(f"[搜索调试] 执行搜索 | 干净项目号：{repr(project_id_clean)} | 自动模式：{self.auto_run}")
             if self.indexing:
                 self.root.after(0, lambda: self.status_var.set("索引正在构建中，搜索结果可能不完整"))
             if not self.all_project_folders:
@@ -2453,31 +2470,15 @@ class PDFMoverApp:
                 self.matched_folders = []
                 self.root.after(0, lambda: self._update_folder_combo([]))
                 return
-            if project_id_clean in self.search_cache:
-                matches = self.search_cache[project_id_clean]
-                self.matched_folders = matches
-                self.root.after(0, lambda: self._update_folder_combo(matches))
-                print(f"[搜索调试] 缓存命中 | 项目号：{project_id_clean} | 匹配数量：{len(matches)}")
-                if self.auto_run and not self.auto_run_paused:
-                    self.root.after(0, self.auto_check_and_process)
-                return
-            matches = []
-            with self.thread_lock:
-                folders = self.all_project_folders.copy()
-            for folder in folders:
-                if self.folder_matches(os.path.basename(folder), project_id_clean):
-                    matches.append(folder)
+            cache_hit = project_id_clean in self.search_cache
+            matches = self._find_folders_for_id(project_id_clean)
             self.matched_folders = matches
-            self.search_cache[project_id_clean] = matches
-            self.search_cache.move_to_end(project_id_clean)
-            if len(self.search_cache) > settings.cache['search_max']:
-                self.search_cache.popitem(last=False)
             self.root.after(0, lambda: self._update_folder_combo(matches))
-            print(f"[搜索调试] 实时搜索完成 | 项目号：{project_id_clean} | 匹配数量：{len(matches)}")
+            log.debug(f"[搜索调试] {'缓存命中' if cache_hit else '实时搜索完成'} | 项目号：{project_id_clean} | 匹配数量：{len(matches)}")
             if self.auto_run and not self.auto_run_paused:
                 self.root.after(0, self.auto_check_and_process)
         except Exception as e:
-            print(f"[错误] _do_search_folders 异常: {traceback.format_exc()}")
+            log.error(f"[错误] _do_search_folders 异常: {traceback.format_exc()}")
             self.root.after(0, lambda: self.status_var.set("搜索出错，请重试"))
             if self.auto_run and not self.auto_run_paused:
                 self.root.after(0, self.auto_check_and_process)
@@ -2549,7 +2550,7 @@ class PDFMoverApp:
                 if os.path.isdir(item_path) and settings.subfolder_matches(item):
                     test_data_folders.append(item_path)
         except Exception as e:
-            print(f"[调试] 读取项目文件夹失败 [{project_folder}]: {e}")
+            log.warning(f"[调试] 读取项目文件夹失败 [{project_folder}]: {e}")
         return test_data_folders
 
     # ========== 手动操作函数 ==========
@@ -2604,11 +2605,7 @@ class PDFMoverApp:
         if not project_id:
             project_id = self.extract_project_id(self.current_text) or '未知编号'
 
-        target_path = os.path.join(target_folder, f"{settings.target_filename}.pdf")
-        counter = 1
-        while os.path.exists(target_path):
-            target_path = os.path.join(target_folder, f"{settings.target_filename}_{counter}.pdf")
-            counter += 1
+        target_path = pure_unique_target_path(target_folder, settings.target_filename)
 
         removed = not is_multi
         op_type = '复制' if is_multi else '移动'
@@ -2622,13 +2619,7 @@ class PDFMoverApp:
             if is_multi:
                 self.status_var.set(f"已复制到 {os.path.basename(target_folder)}")
             else:
-                self.pdf_files.pop(self.current_index)
-                self.listbox.delete(self.current_index)
-                self.current_pdf = None
-                self.canvas.delete("all")
-                self.original_preview_img = None
-                self.folder_combo.set('')
-                self.correct_entry.delete(0, tk.END)
+                self._remove_current_from_list()
                 self.status_var.set("就绪")
             if self.auto_run:
                 self.handle_auto_run_after_action(removed)
@@ -2659,13 +2650,7 @@ class PDFMoverApp:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             self.append_record(self.not_found_excel, [timestamp, os.path.basename(self.current_pdf),
                                                        new_name, project_id])
-            self.pdf_files.pop(self.current_index)
-            self.listbox.delete(self.current_index)
-            self.current_pdf = None
-            self.canvas.delete("all")
-            self.original_preview_img = None
-            self.folder_combo.set('')
-            self.correct_entry.delete(0, tk.END)
+            self._remove_current_from_list()
             self.status_var.set("已标记为未找到")
             if self.auto_run:
                 self.handle_auto_run_after_action(removed=True)
@@ -2697,12 +2682,7 @@ class PDFMoverApp:
                 new_name = settings.build_filename('unidentified', original=old_name)
 
             if new_name:
-                new_path = os.path.join(dir_name, new_name)
-                counter = 1
-                base, ext = os.path.splitext(new_path)
-                while os.path.exists(new_path):
-                    new_path = os.path.join(dir_name, f"{base}_{counter}{ext}")
-                    counter += 1
+                new_path = pure_unique_path(os.path.join(dir_name, new_name))
 
                 self.perform_file_operation(old_path, new_path, is_copy=False)
 
@@ -2719,22 +2699,11 @@ class PDFMoverApp:
             return
 
         if self.auto_run:
-            if self.current_index < len(self.pdf_files):
-                self.pdf_files.pop(self.current_index)
-                self.listbox.delete(self.current_index)
-            self.current_pdf = None
-            self.canvas.delete("all")
-            self.original_preview_img = None
-            self.folder_combo.set('')
-            self.correct_entry.delete(0, tk.END)
+            self._remove_current_from_list()
             self.status_var.set("已跳过")
             self.handle_auto_run_after_action(removed=True)
         else:
-            self.current_pdf = None
-            self.canvas.delete("all")
-            self.original_preview_img = None
-            self.folder_combo.set('')
-            self.correct_entry.delete(0, tk.END)
+            self._clear_current_file_ui()
             self.status_var.set("已跳过")
             cur = self.listbox.curselection()
             if cur:
@@ -2772,6 +2741,12 @@ class PDFMoverApp:
 
 
 if __name__ == "__main__":
+    missing = verify_dependencies()
+    if missing:
+        _root = tk.Tk()
+        _root.withdraw()
+        messagebox.showerror("错误", "\n\n".join(missing))
+        sys.exit(1)
     root = tk.Tk()
     app = PDFMoverApp(root)
     root.mainloop()

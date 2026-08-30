@@ -1,4 +1,6 @@
-pdf2image
-pytesseract
-Pillow
-openpyxl
+# 依赖最低版本（已在 Python 3.13 + 下列版本组合下验证）
+# Pillow>=9.1：代码使用 Image.Resampling 枚举（9.1 引入）
+pdf2image>=1.17.0
+pytesseract>=0.3.10
+Pillow>=9.1.0
+openpyxl>=3.1.0

@@ -9,6 +9,10 @@ from tkinter import filedialog, messagebox, ttk
 # 允许从项目根目录导入 core 配置模块
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.settings import settings, reload_settings  # noqa: E402
+from core.matching import (  # noqa: E402
+    extract_year_from_project_id as pure_extract_year,
+    unique_target_path,
+)
 
 UNKNOWN_FOLDER = settings.year_rules.get('unknown_folder', '未分类')
 
@@ -34,14 +38,11 @@ def extract_project_ids_from_filename(filename):
 
 
 def extract_year_from_project_id(project_id):
-    prefix_len = settings.year_rules.get('prefix_length', 4)
-    century = settings.year_rules.get('century_prefix', '20')
-    number_part = project_id[prefix_len:]
-    if len(number_part) >= 4 and number_part[:2] == century:
-        return number_part[2:4]
-    elif len(number_part) >= 2:
-        return number_part[:2]
-    return None
+    return pure_extract_year(
+        project_id,
+        prefix_length=settings.year_rules.get('prefix_length', 4),
+        century_prefix=settings.year_rules.get('century_prefix', '20'),
+    )
 
 
 def get_full_year(project_id):
@@ -248,12 +249,7 @@ class YearArchiverApp:
                 target_dir = os.path.join(export_root, year_folder)
                 os.makedirs(target_dir, exist_ok=True)
 
-                target_name = f"{pid}.pdf"
-                target_path = os.path.join(target_dir, target_name)
-                counter = 1
-                while os.path.exists(target_path):
-                    target_path = os.path.join(target_dir, f"{pid}_{counter}.pdf")
-                    counter += 1
+                target_path = unique_target_path(target_dir, pid)
 
                 key = (target_path, pid)
                 if key in processed_set:

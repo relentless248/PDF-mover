@@ -21,7 +21,10 @@
 ├── YearArchiver/             # 辅助工具：未找到项目按年份归档
 ├── core/
 │   ├── settings.py           # 集中式配置加载与派生
+│   ├── matching.py           # 纯逻辑工具（年份提取/文件夹匹配/路径防碰撞）
 │   └── settings_dialog.py    # 可视化配置对话框
+├── tests/
+│   └── test_core_logic.py    # 纯逻辑单元测试（python -m unittest discover -s tests）
 ├── settings.example.json     # 通用配置模板（可提交）
 ├── settings.json             # 用户实际配置（运行时生成，不提交）
 ├── config.json               # 目标根目录（用户运行期配置，不提交）
@@ -32,6 +35,7 @@
 
 ## 环境要求
 
+- **仅支持 Windows**（启动脚本、`os.startfile`、Tesseract / Poppler 均使用 Windows 版本）
 - Python 3.10+（或使用项目自带嵌入式运行时）
 - [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)（OCR 引擎）
 - [Poppler for Windows](https://github.com/oschwartz10612/poppler-windows/releases)（PDF 渲染）

@@ -8,7 +8,7 @@ Records/
 
 # 运行产物
 index_cache*.json
-debug.log
+*.log
 Temp/
 __pycache__/
 *.pyc

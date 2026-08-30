@@ -300,11 +300,12 @@ class Settings:
         )
         self._compiled["analyze_see_pattern"] = re.compile(
             r'^' + re.escape(self.relation_keyword) + r'(' + pp + r')_'
-            + re.escape(self.not_found_keyword) + r'(' + pp + r')\.pdf$',
+            + re.escape(self.not_found_keyword) + r'_?(' + pp + r')\.pdf$',
             re.IGNORECASE,
         )
+        # _? 兼容带/不带下划线两种命名，确保能解析 build_filename 自己生成的文件名
         self._compiled["analyze_no_see_pattern"] = re.compile(
-            r'^' + re.escape(self.not_found_keyword) + r'(' + pp + r')\.pdf$',
+            r'^' + re.escape(self.not_found_keyword) + r'_?(' + pp + r')\.pdf$',
             re.IGNORECASE,
         )
 
