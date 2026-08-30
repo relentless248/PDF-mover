@@ -205,7 +205,7 @@ class PDFMoverApp:
         thread.join(timeout)
 
         if not is_completed[0]:
-            log.warning(f"[超时警告] 操作执行超过{timeout}秒，已强制终止")
+            log.warning(f"[超时警告] 操作执行超过{timeout}秒，已放弃等待（后台线程可能仍在运行）")
             raise TimeoutError(f"操作超时，超过{timeout}秒未完成")
         if exception[0] is not None:
             raise exception[0]
