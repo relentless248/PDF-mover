@@ -19,6 +19,7 @@ __pycache__/
 
 # 本地工具 / 环境（非项目文件）
 .workbuddy/
+.zcode/
 site-packages/
 
 # 运行时二进制 —— 不提交（通过 install_deps.bat 获取）
